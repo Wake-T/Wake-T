@@ -855,7 +855,7 @@ class OpenPMDPulse(LaserPulse):
         # The right edge of the Wake-T grid corresponds
         # to the left edge of the Lasy grid.
         xi_max = self.solver_params["zmax"]
-        t_min_0 = self.lasy_profile.axes["t"][0]
+        t_min_0 = float(to_cpu(self.lasy_profile.axes["t"][0]))
         t = (xi_max - xi) / ct.c + t_min_0 - self._t_start
         t_min = np.min(t)
         t_max = np.max(t)

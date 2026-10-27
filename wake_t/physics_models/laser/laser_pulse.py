@@ -758,9 +758,7 @@ class OpenPMDPulse(LaserPulse):
         # is chosen so that, for `t_snapshot=0`, the pulse lands at the same
         # `xi` as with the simple time mapping. A non-zero `t_snapshot` moves
         # the pulse forward by c*t_snapshot, and the window follows it.
-        z_axis = (xi_1d - xi_max) + ct.c * (
-            self._t_snapshot + self._t_start - t_min_0
-        )
+        z_axis = (xi_1d - xi_max) + ct.c * (self._t_snapshot + self._t_start - t_min_0)
 
         # Time grid for the lasy laser. It is built on the sample lattice of
         # the openPMD file (same dt, nodes at t_file[0] + i*dt), extended by

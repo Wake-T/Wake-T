@@ -9,7 +9,6 @@ Authors: Angel Ferran Pousa, Remi Lehe, Manuel Kirchen, Pierre Pelletier.
 
 """
 
-import warnings
 from typing import Optional, Union, Iterable
 
 import numpy as np

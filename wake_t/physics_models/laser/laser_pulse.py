@@ -26,15 +26,15 @@ try:
 except ImportError:
     lasy_installed = False
 
-try:                                                                                    
-    from lasy.backend import to_cpu, to_gpu                                 
-except ImportError:                                                         
-    def to_cpu(arr):                                                        
-        return arr                                                          
+try:
+    from lasy.backend import to_cpu, to_gpu
+except ImportError:
 
-    def to_gpu(arr):                                                        
-        return arr                                                                                                                      
-                  
+    def to_cpu(arr):
+        return arr
+
+    def to_gpu(arr):
+        return arr
 
 
 from .envelope_solver import evolve_envelope
@@ -742,8 +742,8 @@ class OpenPMDPulse(LaserPulse):
 
         # Smooth radial edges of profile.
         if self._smooth_edges:
-            r_file = np.asarray(to_cpu(self.lasy_profile.axes["r"])) 
-            r_smooth = min(float(np.max(r_file)), float(np.max(r))) 
+            r_file = np.asarray(to_cpu(self.lasy_profile.axes["r"]))
+            r_smooth = min(float(np.max(r_file)), float(np.max(r)))
             a_env *= np.exp(-2 * (r / (r_smooth * 0.85)) ** 8)
 
         return a_env
@@ -776,7 +776,7 @@ class OpenPMDPulse(LaserPulse):
 
         # Get 2D slice and change to Wake-T ordering.
         return np.asarray(to_cpu(a_env[0])).T[::-1]
-    
+
     def _envelope_from_export_to_z(self, xi, r):
         """
         Get the envelope in Wake-T coordinates using lasy's `export_to_z`.
@@ -839,7 +839,7 @@ class OpenPMDPulse(LaserPulse):
 
         # E -> a in the spectral domain, exact per frequency:
         # a(omega) = -i e E(omega) / (m_e c omega).
-        # lasy’s field_to_vector_potential uses a single local frequency, 
+        # lasy’s field_to_vector_potential uses a single local frequency,
         # which is not accurate for chirped pulse.
         field_w, dw = laser.grid.get_spectral_field()
         omega = (omega0 + dw).clip(min=0.2 * omega0)  # guard for coarse dt

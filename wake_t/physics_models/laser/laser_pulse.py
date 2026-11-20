@@ -19,11 +19,21 @@ from scipy.ndimage import gaussian_filter
 try:
     from lasy.profiles.from_openpmd_profile import FromOpenPMDProfile
     from lasy.laser import Laser
-    from lasy.utils.laser_utils import field_to_vector_potential
+    from lasy.utils.laser_utils import field_to_vector_potential, export_to_z
 
     lasy_installed = True
 except ImportError:
     lasy_installed = False
+
+try:
+    from lasy.backend import to_cpu, to_gpu
+except ImportError:
+
+    def to_cpu(arr):
+        return arr
+
+    def to_gpu(arr):
+        return arr
 
 
 from .envelope_solver import evolve_envelope
@@ -107,6 +117,14 @@ class LaserPulse:
             raise ValueError(
                 "Number of laser envelope substeps cannot be smaller than 1."
             )
+
+        # Cast to plain Python scalars. The solver is compiled with numba,
+        # which cannot handle e.g. 0-d cupy/numpy arrays (these appear easily
+        # when the grid is derived from lasy axes with the cupy backend).
+        xi_min, xi_max, r_max, dt = (float(v) for v in (xi_min, xi_max, r_max, dt))
+        nz, nr, nt = int(nz), int(nr), int(nt)
+        subgrid_nz = None if subgrid_nz is None else int(subgrid_nz)
+        subgrid_nr = None if subgrid_nr is None else int(subgrid_nr)
 
         # Determine whether to run laser envelope in a subgrid.
         self.use_subgrid = subgrid_nz is not None or subgrid_nr is not None
@@ -637,6 +655,31 @@ class OpenPMDPulse(LaserPulse):
         sequence, or as a single number, in which case it is equal for
         all axes. By default `(5, 0)`, which only smooths along the radial
         direction.
+    use_export_to_z : bool, optional
+        How to convert the lasy pulse, which is defined in time at a fixed
+        plane, into the spatial envelope that Wake-T needs. If `False`
+        (default), the time axis is simply mapped to `xi` through
+        ``xi = xi_max - c * (t - t_min_0 + t_start)`` (frozen-field
+        approximation). If `True`, lasy's ``export_to_z`` is used instead,
+        which reconstructs the field in space at a fixed time by propagating
+        each spectral component in vacuum (via axiprop). This accounts for
+        diffraction during the time the pulse takes to cross the recording
+        plane, which matters for pulses with strong space-time couplings
+        (e.g. flying focus) or for tight focusing with long pulses.
+        Requires `axiprop`, which is a lasy dependency. For best accuracy,
+        the openPMD file should be defined on the Wake-T radial grid
+        (cell-centred radii ``dr/2, 3dr/2, ..., r_max - dr/2``), so that
+        no radial interpolation is needed; a warning is issued otherwise.
+    t_snapshot : float, optional
+        Only used if ``use_export_to_z=True``. The time (in the time
+        coordinates of the openPMD file) at which the spatial snapshot of
+        the pulse is taken, with the file's recording plane at ``z=0``.
+        The Wake-T window follows the pulse, so that, for any `t_snapshot`,
+        the pulse sits at the same `xi` as with ``t_snapshot=0``, but its
+        transverse profile corresponds to a vacuum propagation by
+        ``c * t_snapshot`` from that reference. Use it to start the Wake-T
+        simulation at a plane other than the one stored in the file.
+        By default 0.
 
     Notes
     -----
@@ -659,6 +702,8 @@ class OpenPMDPulse(LaserPulse):
         smooth_edges: Optional[bool] = False,
         apply_gaussian_filter: Optional[bool] = False,
         gaussian_filter_sigma: Optional[Union[int, float, Iterable]] = (5, 0),
+        use_export_to_z: Optional[bool] = False,
+        t_snapshot: Optional[float] = 0.0,
     ) -> None:
         assert lasy_installed, (
             "Using an `OpenPMDPulse` requires `lasy` to be installed. "
@@ -681,13 +726,34 @@ class OpenPMDPulse(LaserPulse):
         self._smooth_edges = smooth_edges
         self._apply_gaussian_filter = apply_gaussian_filter
         self._gaussian_filter_sigma = gaussian_filter_sigma
+        self._use_export_to_z = use_export_to_z
+        self._t_snapshot = t_snapshot
 
     def _envelope_function(self, xi, r, z_pos):
+        if self._use_export_to_z:
+            a_env = self._envelope_from_export_to_z(xi, r)
+        else:
+            a_env = self._envelope_from_time_mapping(xi, r)
+
+        # Apply Gaussian filter.
+        if self._apply_gaussian_filter:
+            a_env = gaussian_filter(a_env, self._gaussian_filter_sigma)
+
+        # Smooth radial edges of profile.
+        if self._smooth_edges:
+            r_file = np.asarray(to_cpu(self.lasy_profile.axes["r"]))
+            r_smooth = min(float(np.max(r_file)), float(np.max(r)))
+            a_env *= np.exp(-2 * (r / (r_smooth * 0.85)) ** 8)
+
+        return a_env
+
+    def _envelope_from_time_mapping(self, xi, r):
+        """Get the envelope in Wake-T coordinates by mapping t to xi."""
         # Change from Wake-T to Lasy coordinates:
         # The right edge of the Wake-T grid corresponds
         # to the left edge of the Lasy grid.
         xi_max = self.solver_params["zmax"]
-        t_min_0 = self.lasy_profile.axes["t"][0]
+        t_min_0 = float(to_cpu(self.lasy_profile.axes["t"][0]))
         t = (xi_max - xi) / ct.c + t_min_0 - self._t_start
         t_min = np.min(t)
         t_max = np.max(t)
@@ -708,15 +774,75 @@ class OpenPMDPulse(LaserPulse):
         a_env = field_to_vector_potential(laser.grid, laser.profile.omega0)
 
         # Get 2D slice and change to Wake-T ordering.
-        a_env = a_env[0].T[::-1]
+        return np.asarray(to_cpu(a_env[0])).T[::-1]
 
-        # Apply Gaussian filter.
-        if self._apply_gaussian_filter:
-            a_env = gaussian_filter(a_env, self._gaussian_filter_sigma)
+    def _envelope_from_export_to_z(self, xi, r):
+        """
+        Get the envelope in Wake-T coordinates using lasy's `export_to_z`.
+        The vector potential is reconstructed in space at time `t_snapshot`,
+        with the recording plane of the openPMD file at z=0. A slice that
+        crosses the plane at time `t` appears at ``z = c * (t_snapshot - t)``.
+        """
+        xi_1d = xi[:, 0]
+        r_1d = r[0]
+        xi_max = self.solver_params["zmax"]
+        t_file = np.asarray(to_cpu(self.lasy_profile.axes["t"]))
+        t_min_0 = t_file[0]
 
-        # Smooth radial edges of profile.
-        if self._smooth_edges:
-            r_smooth = min(np.max(self.lasy_profile.axes["r"]), np.max(r))
-            a_env *= np.exp(-2 * (r / (r_smooth * 0.85)) ** 8)
+        # Lasy-frame position of each Wake-T grid point. For t_snapshot=0 the
+        # pulse lands where the frozen-field mapping puts it; a non-zero
+        # t_snapshot propagates it by c*t_snapshot, and the window follows.
+        z_axis = (xi_1d - xi_max) + ct.c * (self._t_snapshot + self._t_start - t_min_0)
 
-        return a_env
+        # Time grid on the file's own samples, extended by whole samples to
+        # cover the Wake-T window (avoids truncation and FFT wrap-around).
+        # Staying on file nodes avoids interpolating the complex envelope,
+        # which fails for chirped pulses (phase steps up to ~pi per sample).
+        t_window = self._t_snapshot - z_axis / ct.c
+        dt = (t_file[-1] - t_file[0]) / (t_file.size - 1)
+        eps = 1e-6  # round-off tolerance, in samples
+        n_lo = max(0, int(np.ceil((t_file[0] - t_window.min()) / dt - eps)))
+        n_hi = max(0, int(np.ceil((t_window.max() - t_file[-1]) / dt - eps)))
+        t_min = t_file[0] - n_lo * dt
+        t_max = t_file[-1] + n_hi * dt
+        n_t = t_file.size + n_lo + n_hi
+
+        # Radial grid: export_to_z keeps the input radii, so evaluate on the
+        # Wake-T grid. Generate the file on it (r = dr/2, ..., r_max - dr/2,
+        # r_max = nr*dr) to avoid radial interpolation.
+        r_min = r_1d[0]
+        r_max = r_1d[-1]
+
+        # Create Lasy laser
+        laser = Laser(
+            dim="rt",
+            lo=(r_min, t_min),
+            hi=(r_max, t_max),
+            npoints=(r_1d.size, n_t),
+            profile=self.lasy_profile,
+            n_azimuthal_modes=1,
+        )
+        omega0 = float(laser.profile.omega0)
+
+        # E -> a in the spectral domain, exact per frequency:
+        # a(omega) = -i e E(omega) / (m_e c omega).
+        # LASY’s field_to_vector_potential uses a single local frequency,
+        # which is not accurate for chirped pulse.
+        field_w, dw = laser.grid.get_spectral_field()
+        omega = (omega0 + dw).clip(min=0.2 * omega0)  # guard for coarse dt
+        a_w = -1j * ct.e * field_w / (ct.m_e * ct.c * omega)
+        laser.grid.set_spectral_field(a_w)
+
+        # Snapshot at t = t_snapshot. In export_to_z, t0 is the emission time
+        # at z0, so t0 = -t_snapshot. z_axis goes on the lasy backend.
+        a_env = export_to_z(
+            "rt",
+            laser.grid,
+            omega0,
+            z_axis=to_gpu(z_axis),
+            z0=0.0,
+            t0=-float(self._t_snapshot),
+        )
+
+        # Get 2D slice and change to Wake-T ordering.
+        return np.asarray(to_cpu(a_env[0])).T

@@ -811,18 +811,6 @@ class OpenPMDPulse(LaserPulse):
         # Radial grid: export_to_z keeps the input radii, so evaluate on the
         # Wake-T grid. Generate the file on it (r = dr/2, ..., r_max - dr/2,
         # r_max = nr*dr) to avoid radial interpolation.
-        r_file = np.asarray(to_cpu(self.lasy_profile.axes["r"]))
-        dr_wake = r_1d[1] - r_1d[0]
-        if r_file.size != r_1d.size or not np.allclose(
-            r_file, r_1d, rtol=0.0, atol=1e-6 * dr_wake
-        ):
-            warnings.warn(
-                "The radial grid of the openPMD file does not match the Wake-T "
-                "grid (cell-centred radii dr/2, ..., r_max - dr/2), so the laser "
-                "profile will be interpolated in r. For best accuracy, generate "
-                "the file on the Wake-T radial grid.",
-                stacklevel=4,
-            )
         r_min = r_1d[0]
         r_max = r_1d[-1]
 
@@ -839,7 +827,7 @@ class OpenPMDPulse(LaserPulse):
 
         # E -> a in the spectral domain, exact per frequency:
         # a(omega) = -i e E(omega) / (m_e c omega).
-        # lasy’s field_to_vector_potential uses a single local frequency,
+        # LASY’s field_to_vector_potential uses a single local frequency,
         # which is not accurate for chirped pulse.
         field_w, dw = laser.grid.get_spectral_field()
         omega = (omega0 + dw).clip(min=0.2 * omega0)  # guard for coarse dt
@@ -857,5 +845,5 @@ class OpenPMDPulse(LaserPulse):
             t0=-float(self._t_snapshot),
         )
 
-        # Mode 0, Wake-T ordering (nz, nr); z_axis is already ascending in xi.
+        # Get 2D slice and change to Wake-T ordering.
         return np.asarray(to_cpu(a_env[0])).T
